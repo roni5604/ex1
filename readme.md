@@ -37,7 +37,7 @@ This project implements a simple and efficient **star tracker**:
 
 We tested our code on pairs of images from Stellarium (with lens distortion + satellites) and iPhone photos.
 
-You can see the entire process on GitHub at [roni5604/star-tracker](https://github.com/roni5604).
+You can see the entire process on GitHub at [roni5604/ex1](https://github.com/roni5604).
 
 ---
 
