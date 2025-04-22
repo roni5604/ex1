@@ -1,0 +1,15 @@
+# קבצי סביבה וירטואלית
+venv/
+.env/
+.venv/
+ENV/
+env/
+# קבצי פייתון זמניים
+__pycache__/
+*.py[cod]
+*.pyo
+
+
+# קבצי מערכת של macOS
+.DS_Store
+

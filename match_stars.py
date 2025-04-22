@@ -1,300 +1,266 @@
 #!/usr/bin/env python3
 """
-This script identifies matching stars between a “small” image (with few stars)
-and a “large” image (with many stars), by finding the best geometric alignment
-(scale + rotation + translation) that maps as many small-image stars as possible
-onto the large-image stars.
+match_stars.py
 
-Algorithm overview (in simple language):
-1. **Detect stars**:  
-   - Convert image to grayscale and blur to reduce noise.  
-   - Use a “top-hat” filter to remove uneven background light.  
-   - Threshold and clean small artifacts.  
-   - Find contours of bright spots, filter by size, compute each star’s center, radius, and brightness.  
-   - Deduplicate overlapping detections by keeping the brightest in each cluster.  
+Star Matching Between Two Images with Clickable Arrows
+------------------------------------------------------
 
-2. **Match stars**:  
-   - Randomly shuffle all pairs of small-image stars.  
-   - For each small-image pair (p1, p2):  
-     a. Compute their distance and angle → this defines a “model” in small-image space.  
-     b. Loop over every pair in the large image (l1, l2):  
-        • Compute scale = dist(l1,l2) / dist(p1,p2).  
-        • Compute rotation = angle(l2–l1) – angle(p2–p1).  
-        • Compute translation so that p1 maps onto l1.  
-        • Apply this transform to *all* small-image stars and see which land close to a large-image star.  
-        • Use two tolerances: proportional to star size and a fixed pixel margin.  
-        • Count how many small-image stars “matched.”  
-     c. Remember the best mapping; stop early if ≥60% of small-image stars match.  
-
-3. **Annotate results**:  
-   - Draw rectangles and IDs around matching large-image stars.  
-   - Save the aligned image and a CSV of matched star coordinates.
-
-This combination of random sampling of small-image pairs and exhaustive checking
-of large-image pairs finds a high-quality alignment without testing every possible
-small→large pairing (which would be too slow).
+This script:
+1) Detects stars in two images (small.jpg, large.png).
+2) Matches stars by exhaustive geometric alignment.
+3) Outputs annotated images and CSVs into 'output/'.
+4) After ✔ All done., opens an interactive window with three “screens”:
+     ◀  [Before Small]   [Before Large]  ▶
+     ◀  [Detected Small] [Detected Large] ▶
+     ◀  [Matched Small]  [Matched Large]  ▶
+   Click the left/right arrow regions to navigate (wrapping around).
 """
 
-import cv2
+import os, math, csv
 import numpy as np
-import csv
-import math
-import random
+import cv2
+import sep
 from itertools import combinations
 
 # -----------------------------------------------------------------------------
-# Function: detect_stars
+# 1) Setup I/O
 # -----------------------------------------------------------------------------
-def detect_stars(image_path, annotated_path, csv_path,
-                 tophat_kernel=(31,31), thresh_val=5,
-                 min_area=3, max_area=8000,
-                 padding=5, dup_thresh_factor=1.5):
-    """
-    Identify stars in an image, annotate them, and save their properties.
+INPUT_SMALL   = "small.jpg"
+INPUT_LARGE   = "large.png"
+OUTPUT_DIR    = "output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    Steps:
-    1. Read image, convert to grayscale, blur to reduce noise.
-    2. Estimate and subtract background using a morphological 'top-hat' filter.
-    3. Threshold the result to isolate bright spots (potential stars).
-    4. Morphologically clean small artifacts.
-    5. Find contours of bright regions; filter by area to remove too-small or too-large blobs.
-    6. For each remaining contour:
-       - Compute bounding box with padding.
-       - Compute center (cx, cy), radius r from area, and average brightness b.
-    7. Sort detections by brightness descending; deduplicate overlapping blobs
-       by keeping the brightest in each cluster (controlled by dup_thresh_factor).
-    8. Annotate the original image with rectangles and numeric IDs.
-    9. Write a CSV with columns: id, x, y, r, b.
+SMALL_BEFORE  = os.path.join(OUTPUT_DIR, "small_before.jpg")
+LARGE_BEFORE  = os.path.join(OUTPUT_DIR, "large_before.png")
+cv2.imwrite(SMALL_BEFORE, cv2.imread(INPUT_SMALL))
+cv2.imwrite(LARGE_BEFORE, cv2.imread(INPUT_LARGE))
 
-    Returns:
-        List of dicts, each with keys:
-        'id'   : unique integer
-        'x', 'y': center coordinates (floats)
-        'r'    : estimated radius
-        'b'    : mean brightness
-        'bbox' : bounding box tuple (x1, y1, x2, y2)
-    """
-    img  = cv2.imread(image_path)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3,3), 0)
+SMALL_DETECTED = os.path.join(OUTPUT_DIR, "small_detected.jpg")
+LARGE_DETECTED = os.path.join(OUTPUT_DIR, "large_detected.jpg")
+SMALL_MATCHED  = os.path.join(OUTPUT_DIR, "small_matched.jpg")
+LARGE_MATCHED  = os.path.join(OUTPUT_DIR, "large_matched.jpg")
+SMALL_CSV      = os.path.join(OUTPUT_DIR, "small_coords.csv")
+LARGE_CSV      = os.path.join(OUTPUT_DIR, "large_coords.csv")
+MATCHES_CSV    = os.path.join(OUTPUT_DIR, "matches.csv")
 
-    # 1. Background removal (top-hat)
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, tophat_kernel)
-    background  = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel_open)
-    tophat      = cv2.subtract(gray, background)
-
-    # 2. Threshold to binary + clean small noise
-    _, thresh = cv2.threshold(tophat, thresh_val, 255, cv2.THRESH_BINARY)
-    kn = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kn, iterations=1)
-
-    # 3. Find contours of potential stars
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    raw = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < min_area or area > max_area:
-            continue
-
-        # Bounding box with padding
-        x,y,w,h = cv2.boundingRect(cnt)
-        x1 = max(x - padding, 0)
-        y1 = max(y - padding, 0)
-        x2 = min(x + w + padding, img.shape[1]-1)
-        y2 = min(y + h + padding, img.shape[0]-1)
-
-        # Center, radius, and brightness
-        cx = x1 + (x2 - x1)/2.0
-        cy = y1 + (y2 - y1)/2.0
-        r  = math.sqrt(area / math.pi)
-        mask = np.zeros(gray.shape, np.uint8)
-        cv2.drawContours(mask, [cnt], -1, 255, -1)
-        b = cv2.mean(gray, mask=mask)[0]
-
-        raw.append({'cx':cx, 'cy':cy, 'r':r, 'b':b, 'bbox':(x1,y1,x2,y2)})
-
-    # 4. Deduplicate overlapping detections
-    raw.sort(key=lambda s: s['b'], reverse=True)
+# -----------------------------------------------------------------------------
+# 2) Star Detection
+# -----------------------------------------------------------------------------
+def detect_sep(path, thresh_sigma=5.0, min_area=5):
+    img  = cv2.imread(path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    bkg  = sep.Background(gray)
+    data = gray - bkg.back()
+    rms  = np.median(bkg.rms())
+    sep.set_extract_pixstack(data.size * 2)
+    objs = sep.extract(data, thresh=thresh_sigma*rms, err=bkg.rms(), minarea=min_area)
     stars = []
-    for s in raw:
-        if any(math.hypot(s['cx']-u['cx'], s['cy']-u['cy']) <
-               dup_thresh_factor * max(s['r'], u['r']) for u in stars):
-            continue
-        stars.append(s)
+    for i,o in enumerate(objs, start=1):
+        x,y,flux = o['x'], o['y'], o['flux']
+        r = math.sqrt(flux/ math.pi)
+        stars.append({'id':i,'x':x,'y':y,'r':r,'b':flux})
+    return stars
 
-    # 5. Annotate image and write CSV
-    rect_color, rect_thick = (0,255,255), 1
-    font, fs, ft = cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['id','x','y','r','b'])
-        for idx, s in enumerate(stars, start=1):
-            x1,y1,x2,y2 = map(int, s['bbox'])
-            cv2.rectangle(img, (x1,y1),(x2,y2), rect_color, rect_thick)
-            cv2.putText(img, str(idx), (x1, y1-10),
-                        font, fs, rect_color, ft, cv2.LINE_AA)
-            writer.writerow([idx, s['cx'], s['cy'], s['r'], s['b']])
-    cv2.imwrite(annotated_path, img)
+def detect_cc(path, bg_blur=51, thresh_std=0.8, open_disk=3, min_area=2, max_area=200):
+    img  = cv2.imread(path, cv2.IMREAD_GRAYSCALE).astype(np.float32)
+    bg   = cv2.GaussianBlur(img, (bg_blur,bg_blur), 0)
+    data = img - bg
+    med,std = np.median(data), np.std(data)
+    th = med + thresh_std*std
+    bw = (data>th).astype(np.uint8)
+    ker= cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(open_disk,open_disk))
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, ker)
+    nlab, labels, stats, cents = cv2.connectedComponentsWithStats(bw,8)
+    stars, idx = [],1
+    for lab in range(1,nlab):
+        area = stats[lab, cv2.CC_STAT_AREA]
+        if area<min_area or area>max_area: continue
+        cx,cy = cents[lab]
+        flux = float(np.sum(data[labels==lab]))
+        r = math.sqrt(area/math.pi)
+        stars.append({'id':idx,'x':cx,'y':cy,'r':r,'b':flux})
+        idx +=1
+    return stars
 
-    return [
-        {'id': idx, 'x': s['cx'], 'y': s['cy'],
-         'r': s['r'], 'b': s['b'], 'bbox': s['bbox']}
-        for idx, s in enumerate(stars, start=1)
-    ]
+def annotate_all(src, stars, dst):
+    img = cv2.imread(src)
+    for s in stars:
+        x,y,r = int(round(s['x'])),int(round(s['y'])),int(round(s['r']))
+        cv2.circle(img,(x,y),r,(0,255,255),1)
+        cv2.putText(img,str(s['id']), (x+r+2,y),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,255),1)
+    cv2.imwrite(dst, img)
 
 # -----------------------------------------------------------------------------
-# Function: match_stars
+# 3) Exhaustive Matching
 # -----------------------------------------------------------------------------
 def match_stars(small, large,
                 dist_tol_factor=1.2,
                 abs_tol=5.0,
                 match_threshold=0.6):
-    """
-    Find the best alignment (scale + rotation + translation) that maps
-    as many small-image stars onto large-image stars as possible.
+    best, best_score = {}, 0
+    N_small = len(small)
+    min_good = math.ceil(match_threshold * N_small)
+    large_pts = np.array([[l['x'],l['y']] for l in large], dtype=np.float64)
 
-    Steps:
-    1. Build a random ordering of all small-image star pairs.
-    2. For each small-image pair (p1, p2):
-       a. Compute their distance ds and angle ang_s.
-    3. For each large-image pair (l1, l2):
-       a. Compute distance dl and angle ang_l.
-       b. Derive scale = dl / ds, rotation = ang_l - ang_s.
-       c. Compute translation so p1 → l1.
-       d. Apply this transform to *every* small-image star:
-          - new_x = rotated_and_scaled_x + translation_x
-          - new_y = rotated_and_scaled_y + translation_y
-       e. For each transformed small star, find the nearest large star.
-          Use tolerance = (r_small * scale * dist_tol_factor) + abs_tol.
-       f. Count how many small stars fit within tolerance → score.
-    4. Keep the mapping with the highest score.
-    5. Stop early if score ≥ match_threshold * total_small.
-
-    Returns:
-        Dict mapping small_id → large_id for matched stars.
-    """
-    # Precompute large-star coordinates array
-    large_pts = np.array([[l['x'], l['y']] for l in large], dtype=np.float32)
-
-    best_matches, best_score = {}, 0
-    min_good = math.ceil(match_threshold * len(small))
-
-    # 1. Shuffle all small-image pairs
-    small_pairs = list(combinations(small, 2))
-    random.shuffle(small_pairs)
-
-    # 2. Loop over each random small-image pair
-    for p1, p2 in small_pairs:
-        xs1, ys1 = p1['x'], p1['y']
-        xs2, ys2 = p2['x'], p2['y']
-        ds = math.hypot(xs2 - xs1, ys2 - ys1)
-        if ds == 0:
-            continue
-        ang_s = math.atan2(ys2 - ys1, xs2 - xs1)
-
-        # 3. Try aligning to every large-image pair
-        for l1, l2 in combinations(large, 2):
-            xl1, yl1 = l1['x'], l1['y']
-            xl2, yl2 = l2['x'], l2['y']
-            dl = math.hypot(xl2 - xl1, yl2 - yl1)
-            if dl == 0:
-                continue
-
-            # 3b. Compute scale and rotation
-            scale = dl / ds
-            ang_l = math.atan2(yl2 - yl1, xl2 - xl1)
+    for p1,p2 in combinations(small,2):
+        xs1,ys1 = p1['x'],p1['y']
+        xs2,ys2 = p2['x'],p2['y']
+        ds = math.hypot(xs2-xs1, ys2-ys1)
+        if ds==0: continue
+        ang_s = math.atan2(ys2-ys1, xs2-xs1)
+        for l1,l2 in combinations(large,2):
+            xl1,yl1 = l1['x'],l1['y']
+            xl2,yl2 = l2['x'],l2['y']
+            dl = math.hypot(xl2-xl1, yl2-yl1)
+            if dl==0: continue
+            scale = dl/ds
+            ang_l = math.atan2(yl2-yl1, xl2-xl1)
             theta = ang_l - ang_s
             cos_t, sin_t = math.cos(theta), math.sin(theta)
 
-            # 3c–e. Apply transform, test all small stars
-            current = {}
+            curr = {}
             for s in small:
-                dx, dy = s['x'] - xs1, s['y'] - ys1
-                xr = cos_t * dx - sin_t * dy
-                yr = sin_t * dx + cos_t * dy
-                xp = xr * scale + xl1
-                yp = yr * scale + yl1
+                dx,dy = s['x']-xs1, s['y']-ys1
+                xr = cos_t*dx - sin_t*dy
+                yr = sin_t*dx + cos_t*dy
+                xp,yp = xr*scale + xl1, yr*scale + yl1
 
-                tol = s['r'] * scale * dist_tol_factor + abs_tol
-                dists = np.linalg.norm(large_pts - [xp, yp], axis=1)
+                tol = s['r']*scale*dist_tol_factor + abs_tol
+                dists = np.hypot(large_pts[:,0]-xp,
+                                 large_pts[:,1]-yp)
                 j = int(np.argmin(dists))
                 if dists[j] <= tol:
-                    current[s['id']] = large[j]['id']
+                    curr[s['id']] = large[j]['id']
 
-            # 4. Update best mapping if improved
-            score = len(current)
-            if score > best_score:
-                best_score, best_matches = score, current
-                if score >= min_good:
-                    return best_matches
-
-    return best_matches
+            score = len(curr)
+            if score>best_score:
+                best_score, best = score, curr.copy()
+                if score>=min_good:
+                    return best
+    return best
 
 # -----------------------------------------------------------------------------
-# Function: annotate_matches
+# 4) Annotation & CSV
 # -----------------------------------------------------------------------------
-def annotate_matches(image_path, matches, large, output_path):
-    """
-    Draw rectangles and small-image IDs around matched stars
-    on the large image and save the result.
-    """
-    img = cv2.imread(image_path)
-    color, thick = (0,255,0), 2
-    font, fs, ft = cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2
-    lookup = {l['id']: l for l in large}
+def annotate_matched_small(src, small, matches, dst):
+    img = cv2.imread(src)
+    for s in small:
+        sid = s['id']
+        if sid not in matches: continue
+        x,y,r = int(round(s['x'])),int(round(s['y'])),int(round(s['r']))
+        cv2.circle(img,(x,y),r,(0,255,0),2)
+        cv2.putText(img,str(sid),(x+r+2,y),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0),2)
+    cv2.imwrite(dst, img)
 
-    for sid, lid in matches.items():
-        x1, y1, x2, y2 = map(int, lookup[lid]['bbox'])
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, thick)
-        cv2.putText(img, str(sid), (x1, y1-10), font, fs, color, ft, cv2.LINE_AA)
+def annotate_matched_large(src, large, matches, dst):
+    inv = {v:k for k,v in matches.items()}
+    img = cv2.imread(src)
+    for l in large:
+        lid = l['id']
+        if lid not in inv: continue
+        sid = inv[lid]
+        x,y,r = int(round(l['x'])),int(round(l['y'])),int(round(l['r']))
+        cv2.circle(img,(x,y),r,(0,0,255),2)
+        cv2.putText(img,str(sid),(x+r+2,y),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
+    cv2.imwrite(dst, img)
 
-    cv2.imwrite(output_path, img)
+def write_coords(path, stars):
+    with open(path,"w",newline="") as f:
+        w=csv.writer(f)
+        w.writerow(['id','x','y','r','b'])
+        for s in stars:
+            w.writerow([s['id'],s['x'],s['y'],s['r'],s['b']])
+
+def write_matches(path, matches, small, large):
+    sm={s['id']:s for s in small}
+    lg={l['id']:l for l in large}
+    with open(path,"w",newline="") as f:
+        w=csv.writer(f)
+        w.writerow(["small_id","small_x","small_y",
+                    "large_id","large_x","large_y"])
+        for sid,lid in matches.items():
+            S,L=sm[sid],lg[lid]
+            w.writerow([sid,S['x'],S['y'],lid,L['x'],L['y']])
 
 # -----------------------------------------------------------------------------
-# Main execution block
+# 5) Main
 # -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    # 1. Detect stars in the small image (few stars)
-    small = detect_stars(
-        "small.jpg", "small_detected.jpg", "small_coords.csv",
-        tophat_kernel=(15,15), thresh_val=25,
-        min_area=10, max_area=200,
-        padding=5, dup_thresh_factor=3.0
-    )
-    print(f"✔ small.jpg: detected {len(small)} stars")
+if __name__=="__main__":
+    # Detect
+    small=detect_sep(INPUT_SMALL)
+    print(f"small: {len(small)} stars")
+    annotate_all(INPUT_SMALL, small, SMALL_DETECTED)
+    write_coords(SMALL_CSV, small)
 
-    # 2. Detect stars in the large image (many stars)
-    large = detect_stars(
-        "large.png", "large_detected.jpg", "large_coords.csv",
-        tophat_kernel=(31,31), thresh_val=5,
-        min_area=3, max_area=8000,
-        padding=5, dup_thresh_factor=1.5
-    )
-    print(f"✔ large.png: detected {len(large)} stars")
+    large=detect_cc(INPUT_LARGE)
+    print(f"large: {len(large)} stars")
+    annotate_all(INPUT_LARGE, large, LARGE_DETECTED)
+    write_coords(LARGE_CSV, large)
 
-    # 3. Match stars with geometric alignment
-    matches = match_stars(
-        small, large,
-        dist_tol_factor=1.2,   # proportional tolerance
-        abs_tol=5.0,           # fixed pixel tolerance
-        match_threshold=0.6    # stop when ≥60% matched
-    )
-    pct = len(matches) / len(small) * 100 if small else 0
-    print(f"✔ matched {len(matches)}/{len(small)} stars ({pct:.1f}%)")
+    matches=match_stars(small, large)
+    print(f"matched {len(matches)}/{len(small)} stars")
+    write_matches(MATCHES_CSV, matches, small, large)
 
-    # 4. Annotate and save the final matched image
-    annotate_matches("large.png", matches, large, "large_matched.jpg")
-    print("✔ large_matched.jpg saved")
+    annotate_matched_small(INPUT_SMALL, small, matches, SMALL_MATCHED)
+    annotate_matched_large(INPUT_LARGE, large, matches, LARGE_MATCHED)
 
-    # 5. Write CSV of matched coordinate pairs
-    with open("matches.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["small_id","small_x","small_y","large_id","large_x","large_y"])
-        ls = {s['id']: s for s in small}
-        ll = {l['id']: l for l in large}
-        for sid, lid in matches.items():
-            S, L = ls[sid], ll[lid]
-            w.writerow([sid, S['x'], S['y'], lid, L['x'], L['y']])
-    print("✔ matches.csv saved")
-    print("✔ Done.")
-    
+    print("✔ All done.")
+
+    # -----------------------------------------------------------------------------
+    # 6) Interactive 3‑Screen Display with Clickable Arrows
+    # -----------------------------------------------------------------------------
+    # Prepare stages
+    stages = [
+      ("Before Matching", SMALL_BEFORE, LARGE_BEFORE),
+      ("After Detection", SMALL_DETECTED, LARGE_DETECTED),
+      ("After Matching", SMALL_MATCHED, LARGE_MATCHED),
+    ]
+
+    def make_stage(title, path_s, path_l, height=600, arrow_w=100):
+        # load and resize both images to same height
+        im_s, im_l = cv2.imread(path_s), cv2.imread(path_l)
+        h_scale = height / max(im_s.shape[0], im_l.shape[0])
+        rs = cv2.resize(im_s, (int(im_s.shape[1]*h_scale), height))
+        rl = cv2.resize(im_l, (int(im_l.shape[1]*h_scale), height))
+        comp = cv2.hconcat([rs, rl])
+        # draw title bar
+        cv2.rectangle(comp, (0,0), (comp.shape[1], 40), (0,0,0), -1)
+        cv2.putText(comp, title, (10,30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2)
+        # draw left arrow
+        pts = np.array([[20, height//2],
+                        [arrow_w-20, height//2-40],
+                        [arrow_w-20, height//2+40]], np.int32)
+        cv2.fillConvexPoly(comp, pts, (200,200,200))
+        # draw right arrow
+        w = comp.shape[1]
+        pts = np.array([[w-20, height//2],
+                        [w-arrow_w+20, height//2-40],
+                        [w-arrow_w+20, height//2+40]], np.int32)
+        cv2.fillConvexPoly(comp, pts, (200,200,200))
+        return comp
+
+    imgs = [make_stage(t, s, l) for (t,s,l) in stages]
+    idx = 0
+    win = "Star Matching Steps"
+    arrow_w = 100
+
+    # mouse callback
+    def on_mouse(evt, x, y, flags, param):
+        global idx
+        if evt == cv2.EVENT_LBUTTONDOWN:
+            w = imgs[idx].shape[1]
+            if x < arrow_w:
+                idx = (idx-1) % len(imgs)
+            elif x > w - arrow_w:
+                idx = (idx+1) % len(imgs)
+            cv2.imshow(win, imgs[idx])
+
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(win, on_mouse)
+    cv2.imshow(win, imgs[idx])
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
