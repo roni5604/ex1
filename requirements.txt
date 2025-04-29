@@ -1,0 +1,4 @@
+numpy==2.2.5
+opencv-python==4.11.0.86
+sep==1.4.1
+PySide6==6.9.0

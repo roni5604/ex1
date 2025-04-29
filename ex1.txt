@@ -1,0 +1,9 @@
+מטלה 1
+תז
+רוני מיכאלי 209233873
+נטע כהן 325195774
+
+קישור לגיט
+https://github.com/roni5604/ex1
+
+https://github.com/roni5604/ex1.git
