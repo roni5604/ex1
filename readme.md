@@ -179,7 +179,8 @@ Press **ESC** or **q** to exit.
   ```
   small_id, small_x, small_y, large_id, large_x, large_y
   ```
-
+### Example report
+- https://docs.google.com/document/d/1pWkboQwsMg-tWcEqmg-4SNYhKr6pezU9J3f7ou16-D4/edit?tab=t.0
 ---
 
 ## 🗂️ Project Structure
